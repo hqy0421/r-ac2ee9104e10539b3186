@@ -27,6 +27,11 @@
       <a class="nav-link{% block import_tab_class %}{% endblock %}" href="{{ url_for('table_import', table=table) }}">Import</a>
     </li>
     {% endif %}
+    {% if not dataset.is_readonly and not is_view %}
+    <li class="nav-item{% if dataset.is_readonly or (is_view and 'insert' not in view_ops) %} ml-auto{% endif %}">
+      <a class="nav-link{% block sync_tab_class %}{% endblock %}" href="{{ url_for('table_sync', table=table) }}">Sync</a>
+    </li>
+    {% endif %}
     <li class="nav-item{% if dataset.is_readonly or (is_view and 'insert' not in view_ops) %} ml-auto{% endif %}">
       <a class="nav-link{% block export_tab_class %}{% endblock %}" href="{{ url_for('table_export', table=table) }}">Export</a>
     </li>

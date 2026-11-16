@@ -55,6 +55,8 @@ Then navigate to http://localhost:8080/ to view your database.
 * Import JSON or CSV files.
 * Browse table data.
 * Insert, Update or Delete rows.
+* Synchronize a target table from an ordinary staging table using a business
+  key, version and insert/update/delete markers.
 * Load and unload databases at run-time (see `--enable-load` or `--enable-filesystem`)
 
 ### Screenshots
@@ -109,6 +111,49 @@ When configured with `--enable-load` or `--enable-filesystem` additional
 databases can be loaded or unloaded at run-time:
 
 ![](https://media.charlesleifer.com/blog/photos/sqlite-web-attach-db.png)
+
+### Staging-table synchronization
+
+The `sync` tab applies changes that a source system has landed in an ordinary
+staging table onto a target table. On the page you pick:
+
+* the staging table;
+* one or more **business-key** columns and the target columns they locate
+  rows by (the target key must be unique);
+* a **version** column;
+* an insert/update/delete **marker** column and the values that mean I, U and
+  D;
+* a field mapping of target columns to staging columns. Unmapped target
+  columns are never touched.
+
+Synchronization rules:
+
+* Inserts and updates are **full after-images**: every mapped column is
+  written verbatim, including `NULL`, which overwrites the previous value.
+* For each business key the **highest version wins**, regardless of row order
+  within the staging table or the order in which batches arrive. Older
+  changes are reported as *expired* and never written.
+* Re-running an applied batch **rewrites nothing**; matching rows are counted
+  as *replayed*. The same latest version arriving with different content is a
+  hard conflict and aborts the run.
+* A delete **tombstones** the key, so an older insert/update that shows up
+  later cannot bring the row back. A strictly newer after-image re-creates the
+  row without reusing the old primary key.
+* Pre-existing target rows are treated as a baseline: updates preserve the
+  original primary key and unmapped columns, and deletes honor the table's
+  foreign-key constraints.
+* Target rows, applied versions and tombstone states commit in **one
+  transaction**; any constraint failure rolls the whole batch back.
+* If a managed target row is changed through the normal browser editor or raw
+  SQL between runs, the next sync stops and reports the drift instead of
+  overwriting it. Use **Rebaseline** to acknowledge those external edits and
+  adopt the current contents as the new baseline.
+* Configuration, applied versions, tombstones and run history are stored in
+  bookkeeping tables inside the database (hidden from the table list), so they
+  survive restarts and are never mixed between databases.
+
+A **Dry run** plans the batch and shows what would insert, update, delete,
+replay or expire without writing anything.
 
 ### Command-line options
 

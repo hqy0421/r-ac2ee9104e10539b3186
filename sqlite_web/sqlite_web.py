@@ -80,10 +80,12 @@ try:
     from sqlite_web.executor import (
         Result, is_read, key_decode, key_encode, run_one, run_script,
         split_statements, wrap)
+    from sqlite_web import sync as sync_module
 except ImportError:
     from executor import (
         Result, is_read, key_decode, key_encode, run_one, run_script,
         split_statements, wrap)
+    import sync as sync_module
 
 
 CUR_DIR = os.path.realpath(os.path.dirname(__file__))
@@ -1120,6 +1122,16 @@ def table_insert(table):
         table=table)
 
 @app.template_global()
+def is_sync_table(name):
+    return sync_module.is_sync_table(name)
+
+
+@app.template_test('sync_table')
+def _is_sync_table_test(name):
+    return sync_module.is_sync_table(name)
+
+
+@app.template_global()
 def back_url(table):
     """
     The content-tab url the user came from, page and ordering included.
@@ -1471,6 +1483,171 @@ def table_import(table):
         count=count,
         strict=strict,
         table=table)
+
+def _sync_form_config(dataset, table, form):
+    """Parse the sync-page form into a validated SyncConfig."""
+    stage_table = (form.get('stage_table') or '').strip()
+    version_column = (form.get('version_column') or '').strip()
+    flag_column = (form.get('flag_column') or '').strip()
+    key_columns = [c for c in form.getlist('key_columns') if c]
+    target_key_columns = []
+    for col in key_columns:
+        target_col = form.get('key_target_%s' % col)
+        # Only the select paired with a checked staging key is meaningful.
+        if target_col and target_col not in target_key_columns:
+            target_key_columns.append(target_col)
+    if not target_key_columns:
+        # Same-named columns on both sides is the common case.
+        target_key_columns = list(key_columns)
+    mapping = {}
+    for target_col in form.getlist('map_target'):
+        stage_col = form.get('map_%s' % target_col)
+        if stage_col:
+            mapping[target_col] = stage_col
+    config = sync_module.SyncConfig(
+        target_table=table,
+        stage_table=stage_table,
+        key_columns=key_columns,
+        target_key_columns=target_key_columns,
+        version_column=version_column,
+        flag_column=flag_column,
+        insert_value=(form.get('insert_value')
+                      or sync_module.DEFAULT_INSERT_MARKER),
+        update_value=(form.get('update_value')
+                      or sync_module.DEFAULT_UPDATE_MARKER),
+        delete_value=(form.get('delete_value')
+                      or sync_module.DEFAULT_DELETE_MARKER),
+        mapping=mapping)
+    if stage_table == table:
+        raise sync_module.SyncError(
+            'The staging table must differ from the target table.')
+    sync_module.validate_config(dataset, config)
+    return config
+
+
+@app.route('/<table>/sync/', methods=['GET', 'POST'])
+@require_table
+def table_sync(table):
+    dataset = get_dataset()
+    dataset.ensure_cache()
+
+    if dataset.cached_is_view(table):
+        flash('Synchronization is only available for base tables, not views.',
+              'danger')
+        return redirect(url_for('table_structure', table=table))
+    if dataset.is_readonly:
+        flash('Synchronization is disabled in read-only mode.', 'danger')
+        return redirect(url_for('table_content', table=table))
+
+    config = sync_module.get_config(dataset, table)
+    stage_tables = [t for t in sorted(dataset.cached_tables())
+                    if not sync_module.is_sync_table(t) and t != table]
+    target_columns = [c.name for c in dataset.get_columns(table)]
+    stage_columns = []
+    if config:
+        stage_columns = [c.name
+                         for c in dataset.get_columns(config.stage_table)]
+    elif request.method == 'POST' and request.form.get('stage_table'):
+        chosen = request.form['stage_table']
+        if chosen in dataset.cached_tables():
+            stage_columns = [c.name for c in dataset.get_columns(chosen)]
+    elif request.method == 'GET' and request.args.get('stage_table'):
+        chosen = request.args['stage_table']
+        if chosen in dataset.cached_tables() and \
+                not sync_module.is_sync_table(chosen):
+            stage_columns = [c.name for c in dataset.get_columns(chosen)]
+
+    plan = None
+    plan_dry_run = False
+    if request.method == 'POST':
+        action = request.form.get('action')
+        try:
+            if action == 'delete-config':
+                sync_module.delete_config(dataset, table)
+                dataset.update_cache(table)
+                flash('Sync configuration and applied-version state were '
+                      'removed; run history was retained.', 'success')
+                return redirect(url_for('table_sync', table=table))
+
+            if action == 'rebaseline':
+                if config is None:
+                    raise sync_module.SyncError(
+                        'Save a configuration before rebaselining.')
+                with dataset.transaction():
+                    result = sync_module.rebaseline(dataset, table)
+                dataset.update_cache(table)
+                flash('Rebaselined: adopted %d key(s), dropped %d missing '
+                      'key(s).' % (result['kept'], result['removed']),
+                      'success')
+                return redirect(url_for('table_sync', table=table))
+
+            parsed = _sync_form_config(dataset, table, request.form)
+            # Reflect the just-submitted staging columns in the rendered form.
+            stage_columns = [c.name
+                             for c in dataset.get_columns(parsed.stage_table)]
+
+            if action == 'save':
+                with dataset.transaction():
+                    sync_module.save_config(dataset, parsed)
+                dataset.update_cache(table)
+                config = sync_module.get_config(dataset, table)
+                flash('Sync configuration saved. It is stored in the '
+                      'database and persists across restarts.', 'success')
+                return redirect(url_for('table_sync', table=table))
+
+            if action in ('dry-run', 'sync'):
+                dry_run = action == 'dry-run'
+                with dataset.transaction() as txn:
+                    result = sync_module.plan_and_apply(
+                        dataset, parsed, dry_run=dry_run)
+                    if dry_run:
+                        txn.rollback()
+                plan = result['plan']
+                plan_dry_run = dry_run
+                if dry_run:
+                    flash('Dry run: %d would apply, %d replayed, %d expired. '
+                          'No rows were changed.'
+                          % (result['applied'], result['replayed'],
+                             result['expired']), 'info')
+                else:
+                    dataset.update_cache(table)
+                    config = sync_module.get_config(dataset, table)
+                    flash('Sync applied %d change(s); %d replayed, %d stale '
+                          'change(s) skipped. Target rows, applied versions '
+                          'and tombstones committed together.'
+                          % (result['applied'], result['replayed'],
+                             result['expired']), 'success')
+            else:
+                flash('Unknown sync action.', 'danger')
+        except sync_module.SyncError as exc:
+            flash('Sync stopped: %s' % exc, 'danger')
+            app.logger.info('Sync on %s refused: %s', table, exc)
+        except Exception as exc:
+            flash('Sync failed and the whole batch was rolled back: %s'
+                  % exc, 'danger')
+            app.logger.exception('Error synchronizing table %s.', table)
+
+    summary = sync_module.state_summary(dataset, table)
+    states, state_total = sync_module.state_rows(dataset, table)
+    runs = sync_module.recent_runs(dataset, table)
+
+    return render_template(
+        'table_sync.html',
+        config=config,
+        stage_tables=stage_tables,
+        stage_columns=stage_columns,
+        target_columns=target_columns,
+        summary=summary,
+        states=states,
+        state_total=state_total,
+        runs=runs,
+        plan=plan,
+        plan_dry_run=plan_dry_run,
+        table=table,
+        default_markers=(sync_module.DEFAULT_INSERT_MARKER,
+                         sync_module.DEFAULT_UPDATE_MARKER,
+                         sync_module.DEFAULT_DELETE_MARKER))
+
 
 @app.route('/<table>/drop/', methods=['GET', 'POST'])
 @require_table

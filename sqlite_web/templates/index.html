@@ -27,7 +27,7 @@
       </tr>
       <tr>
         <th class="text-muted font-weight-normal pr-4">Objects</th>
-        <td>{{ dataset.cached_tables()|length }} tables &middot;
+        <td>{{ dataset.cached_tables()|reject('sync_table')|list|length }} tables &middot;
             {{ dataset.get_all_indexes()|length }} indexes &middot;
             {{ dataset.get_all_views()|length }} views &middot;
             {{ dataset.get_all_triggers()|length }} triggers</td>

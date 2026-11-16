@@ -199,6 +199,30 @@ App = window.App || {};
         if (sqlTextarea.length > 0) {
             sqlTextarea.focus();
         }
+
+        /* Sync page: reloading the page lists the chosen staging table's
+           columns. A GET keeps the form itself unsubmitted. */
+        var stageSelect = $('select#id_stage_table');
+        if (stageSelect.length > 0) {
+            stageSelect.on('change', function() {
+                var value = $(this).val();
+                if (value) {
+                    window.location = window.location.pathname +
+                        '?stage_table=' + encodeURIComponent(value);
+                }
+            });
+        }
+
+        /* Sync page: a target-key select only participates for checked
+           staging key columns. Disabled selects are not submitted, so enable
+           them all just for the form submission. */
+        $('input.sync-key-col').on('change', function() {
+            var select = $(this).closest('tr').find('select.key-target-select');
+            select.prop('disabled', !this.checked);
+        });
+        $('#sync-form').on('submit', function() {
+            $(this).find('select.key-target-select').prop('disabled', false);
+        });
     };
 
     /* Per-database namespace for localStorage keys. */
